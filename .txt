@@ -1,0 +1,269 @@
+// package api
+
+// import (
+// 	"encoding/json"
+// 	"errors"
+// 	"fmt"
+// 	"io"
+// 	"net/http"
+// 	"net/url"
+// 	"sort"
+// 	"sync"
+
+// 	"github.com/Masterminds/semver/v3"
+// 	"github.com/gorilla/mux"
+// )
+
+// var testHTTPClient *http.Client
+
+// // SetTestHTTPClient sets the HTTP client used for testing. This is used to
+// // test the packageHandler function.
+// func SetTestHTTPClient(client *http.Client) {
+// 	testHTTPClient = client
+// }
+
+// type SafeDependencyMap struct {
+// 	mu   sync.Mutex
+// 	deps map[string]*NpmPackageVersion
+// }
+
+// // Set sets a key-value pair in the dependency map. This is a thread-safe
+// // operation.
+// func (s *SafeDependencyMap) Set(key string, value *NpmPackageVersion) {
+// 	s.mu.Lock()
+// 	defer s.mu.Unlock()
+// 	s.deps[key] = value
+// }
+
+// // Get retrieves a dependency from the map by key. If the key is not present in the map, the second return value is false.
+// func (s *SafeDependencyMap) Get(key string) (*NpmPackageVersion, bool) {
+// 	s.mu.Lock()
+// 	defer s.mu.Unlock()
+// 	val, ok := s.deps[key]
+// 	return val, ok
+// }
+
+// // New returns a new HTTP handler that exposes a single endpoint: /package/{package}/{version}.
+// // This endpoint returns a JSON representation of the dependency tree for the given package and version.
+// func New() http.Handler {
+// 	router := mux.NewRouter()
+// 	router.Handle("/package/{package}/{version}", http.HandlerFunc(packageHandler))
+// 	return LoggingMiddleware(router)
+// }
+
+// type npmPackageMetaResponse struct {
+// 	Versions map[string]npmPackageResponse `json:"versions"`
+// }
+
+// type npmPackageResponse struct {
+// 	Name         string             `json:"name"`
+// 	Version      string             `json:"version"`
+// 	Dependencies *SafeDependencyMap `json:"dependencies"`
+// }
+
+// type NpmPackageVersion struct {
+// 	Name         string             `json:"name"`
+// 	Version      string             `json:"version"`
+// 	Dependencies *SafeDependencyMap `json:"dependencies"`
+// }
+
+// // packageHandler is the HTTP handler for the /package/{package}/{version} endpoint.
+// // It resolves the dependency tree for the given package and version, and returns it as a JSON response.
+// func packageHandler(w http.ResponseWriter, r *http.Request) {
+// 	vars := mux.Vars(r)
+// 	pkgName := url.QueryEscape(vars["package"])
+// 	pkgVersion := vars["version"]
+
+// 	rootPkg := &NpmPackageVersion{Name: pkgName, Dependencies: &SafeDependencyMap{}}
+// 	if err := resolveDependencies(rootPkg, pkgVersion); err != nil {
+// 		http.Error(w, err.Error(), http.StatusInternalServerError)
+// 		fmt.Printf("Error resolving package %s@%s: %s\n", pkgName, pkgVersion, err)
+// 		return
+// 	}
+
+// 	stringified, err := json.MarshalIndent(rootPkg, "", "  ")
+// 	if err != nil {
+// 		http.Error(w, err.Error(), http.StatusInternalServerError)
+// 		fmt.Printf("Error marshalling package response for %s@%s to JSON: %s\n", pkgName, pkgVersion, err)
+// 		return
+// 	}
+
+// 	w.Header().Set("Content-Type", "application/json")
+// 	w.WriteHeader(200)
+
+// 	// Ignoring ResponseWriter errors
+// 	_, _ = w.Write(stringified)
+// 	fmt.Printf("Served package %s@%s\n", pkgName, pkgVersion)
+// }
+
+// var (
+// 	packageCache = make(map[string]*NpmPackageVersion)
+// 	cacheMutex   sync.RWMutex
+// )
+
+// // getCachedPackage looks up a package with the given name and version in
+// // the cache, returning the package if it exists, and whether it was found.
+// func getCachedPackage(name, version string) (*NpmPackageVersion, bool) {
+// 	cacheMutex.RLock()
+// 	defer cacheMutex.RUnlock()
+// 	pkg, ok := packageCache[name+":"+version]
+// 	return pkg, ok
+// }
+
+// // setCachedPackage sets a package in the cache with the given name and
+// // version. If a package with the same name and version is already in the
+// // cache, this function will overwrite it.
+// func setCachedPackage(name, version string, pkg *NpmPackageVersion) {
+// 	cacheMutex.Lock()
+// 	defer cacheMutex.Unlock()
+// 	packageCache[name+":"+version] = pkg
+// }
+
+// // resolveDependencies resolves the dependencies of a given package to the
+// // highest compatible version matching the given version constraint. If the
+// // package has already been resolved with the same version constraint, it will
+// // be returned from the cache.
+// func resolveDependencies(pkg *NpmPackageVersion, versionConstraint string) error {
+// 	if cachedPkg, ok := getCachedPackage(pkg.Name, versionConstraint); ok {
+// 		*pkg = *cachedPkg
+// 		return nil
+// 	}
+
+// 	pkgMeta, err := fetchPackageMeta(pkg.Name)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	concreteVersion, err := highestCompatibleVersion(versionConstraint, pkgMeta)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	pkg.Version = concreteVersion
+
+// 	npmPkg, err := fetchPackage(pkg.Name, pkg.Version)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	var wg sync.WaitGroup
+
+// 	// Calculate the length of dependencies using the actual map
+// 	dependenciesLen := 0
+// 	if npmPkg.Dependencies != nil {
+// 		dependenciesLen = len(npmPkg.Dependencies.deps)
+// 	}
+// 	errChan := make(chan error, dependenciesLen)
+
+// 	pkg.Dependencies = &SafeDependencyMap{deps: make(map[string]*NpmPackageVersion)}
+
+// 	if npmPkg.Dependencies != nil {
+// 		for dependencyName, dependencyVersionConstraint := range npmPkg.Dependencies.deps {
+// 			if dependencyVersionConstraint == nil {
+// 				continue // Skip this dependency if the version constraint is nil
+// 			}
+// 			wg.Add(1)
+// 			go func(name string, constraint *NpmPackageVersion) {
+// 				defer wg.Done()
+// 				dep := &NpmPackageVersion{
+// 					Name:         name,
+// 					Dependencies: &SafeDependencyMap{deps: make(map[string]*NpmPackageVersion)},
+// 				}
+// 				pkg.Dependencies.Set(name, dep)
+// 				if err := resolveDependencies(dep, constraint.Version); err != nil {
+// 					errChan <- err
+// 				}
+// 			}(dependencyName, dependencyVersionConstraint)
+// 		}
+// 	}
+
+// 	go func() {
+// 		wg.Wait()
+// 		close(errChan)
+// 	}()
+
+// 	for err := range errChan {
+// 		if err != nil {
+// 			return err
+// 		}
+// 	}
+
+// 	setCachedPackage(pkg.Name, pkg.Version, pkg)
+// 	return nil
+// }
+
+// // highestCompatibleVersion takes a semantic version constraint string and a
+// // npm package meta response and returns the highest version number that
+// // satisfies the constraint. If no compatible versions are found, an error is
+// // returned.
+// func highestCompatibleVersion(constraintStr string, versions *npmPackageMetaResponse) (string, error) {
+// 	constraint, err := semver.NewConstraint(constraintStr)
+// 	if err != nil {
+// 		return "", err
+// 	}
+// 	filtered := filterCompatibleVersions(constraint, versions)
+// 	sort.Sort(filtered)
+// 	if len(filtered) == 0 {
+// 		return "", errors.New("no compatible versions found")
+// 	}
+// 	return filtered[len(filtered)-1].String(), nil
+// }
+
+// // filterCompatibleVersions takes a semantic version constraint and an npm package
+// // meta response and returns a sorted collection of version numbers that satisfy
+// // the constraint.
+// func filterCompatibleVersions(constraint *semver.Constraints, pkgMeta *npmPackageMetaResponse) semver.Collection {
+// 	var compatible semver.Collection
+// 	for version := range pkgMeta.Versions {
+// 		semVer, err := semver.NewVersion(version)
+// 		if err != nil {
+// 			continue
+// 		}
+// 		if constraint.Check(semVer) {
+// 			compatible = append(compatible, semVer)
+// 		}
+// 	}
+// 	return compatible
+// }
+
+// // fetchPackage takes a package name and version and returns the corresponding
+// // response from the npm registry, or an error if something goes wrong.
+// func fetchPackage(name, version string) (*npmPackageResponse, error) {
+// 	escapedName := url.QueryEscape(name)
+// 	resp, err := http.Get(fmt.Sprintf("https://registry.npmjs.org/%s/%s", escapedName, version))
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	defer resp.Body.Close()
+
+// 	body, err := io.ReadAll(resp.Body)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	var parsed npmPackageResponse
+// 	_ = json.Unmarshal(body, &parsed)
+// 	return &parsed, nil
+// }
+
+// // fetchPackageMeta takes a package name and fetches the corresponding meta
+// // response from the npm registry, returning the parsed response or an error if
+// // something goes wrong.
+// func fetchPackageMeta(p string) (*npmPackageMetaResponse, error) {
+// 	escapedName := url.QueryEscape(p)
+// 	resp, err := http.Get(fmt.Sprintf("https://registry.npmjs.org/%s", escapedName))
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	defer resp.Body.Close()
+
+// 	body, err := io.ReadAll(resp.Body)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	var parsed npmPackageMetaResponse
+// 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+// 		return nil, err
+// 	}
+
+// 	return &parsed, nil
+// }
