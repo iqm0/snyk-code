@@ -74,12 +74,13 @@ func resolveDependencies(pkg *NpmPackageVersion, versionConstraint string, paren
 	}
 	pkg.Version = concreteVersion
 
+	// concat string with package name and version to use as key in map
 	key := pkg.Name + "@" + pkg.Version
-	if parents[key] {
+	if parents[key] { // if visited, exits recursion
 		log.Printf("Already resolved, skipping %s@%s", pkg.Name, pkg.Version)
 		return nil
 	}
-	parents[key] = true
+	parents[key] = true // marks key as visited
 
 	npmPkg, err := fetchPackage(pkg.Name, pkg.Version)
 	if err != nil {
